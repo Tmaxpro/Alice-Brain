@@ -1,107 +1,148 @@
-import logging
+"""
+ALICE Brain — Investigation Agent (agents/investigation.py)
+──────────────────────────────────────────────────────────
+Enrichit l'alerte via AbuseIPDB + corrélation ES + analyse narrative LLM.
+Retourne un dict de mise à jour du state AliceState.
+"""
+
+from __future__ import annotations
+
 import json
-from typing import Dict, Any
-from models.incident import IncidentState, Investigation
-from services.abuseipdb import abuseipdb_client
-from services.elasticsearch import es_service
-from config import settings
+import logging
+from datetime import datetime
+from typing import Any
 
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_anthropic import ChatAnthropic
+
+from models.alert import Alert
+from models.incident import Investigation, IOC
+from services.abuseipdb import abuseipdb_client
+from services.elasticsearch import es_service
+from services.llm_factory import llm
+from services.websocket_manager import ws_manager
+from config import settings
 
 logger = logging.getLogger(__name__)
 
-class InvestigationAgent:
-    def __init__(self):
-        self.llm = ChatAnthropic(
-            model="claude-3-5-sonnet-20241022",
-            temperature=0,
-            max_tokens=2048,
-            anthropic_api_key=settings.ANTHROPIC_API_KEY,
-            max_retries=3
-        ) if settings.ANTHROPIC_API_KEY and settings.ANTHROPIC_API_KEY != "your_anthropic_api_key_here" else None
-
-        self.system_prompt = """Tu es un analyste SOC senior. Analyse cet incident de sécurité et fournis au format JSON STRICT : 
+INVESTIGATION_PROMPT = """Tu es un analyste SOC senior expert en threat intelligence.
+Analyse cet incident et retourne UNIQUEMENT ce JSON strict, sans markdown :
 {
-  "summary": "Résumé en 3 phrases",
-  "mitre_ttps": ["T1110", "T1078"],
-  "confidence_level": "High/Medium/Low",
-  "iocs": ["ip", "hash"]
+  "summary": "résumé en 3 phrases max",
+  "mitre_ttps": ["TA0001", "T1110"],
+  "iocs": [{"type": "ip", "value": "1.2.3.4", "context": "source de l'attaque"}],
+  "confidence": "HIGH",
+  "next_likely_action": "prédiction comportement attaquant"
 }"""
 
-    async def _analyze_with_claude(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        if not self.llm:
-            return {
-                "summary": "IA désactivée. Résumé automatique : Attaque potentielle de type brute force ou scan.",
-                "mitre_ttps": ["T1110 Brute Force"],
-                "confidence_level": "Medium",
-                "iocs": [context.get("alert", {}).get("source_ip")]
-            }
 
-        prompt = f"Contexte de l'incident: {json.dumps(context, default=str)}"
+async def run_investigation(state: dict[str, Any]) -> dict:
+    """Nœud LangGraph : enrichissement + analyse narrative."""
+    alert: Alert | None = state.get("alert")
+    incident_id: str = state.get("incident_id", "?")
+    timeline = list(state.get("timeline", []))
+
+    if not alert:
+        return {"status": "planning", "error": "No alert to investigate"}
+
+    logger.info("[investigation] Starting for incident %s (IP: %s)", incident_id, alert.source_ip)
+
+    # ── 1. Enrichissement AbuseIPDB ──
+    abuse_data = await abuseipdb_client.check_ip(alert.source_ip)
+    abuse_score = abuse_data.get("abuseConfidenceScore", 0)
+
+    # ── 2. Corrélation temporelle ES (24h) ──
+    correlated_logs = await es_service.get_logs_for_ip(alert.source_ip, hours=24)
+    freq_count = len(correlated_logs)
+
+    # ── 3. Asset criticality (heuristique simple) ──
+    is_critical_asset = any(
+        kw in str(alert.raw_logs).lower()
+        for kw in ("root", "admin", "bastion", "prod", "db")
+    )
+    asset_criticality = 80 if is_critical_asset else 30
+
+    # ── 4. Calcul risk_score ──
+    freq_score = min(100, freq_count * 2)  # Cap à 100
+    risk_score = round(
+        (abuse_score * 0.4) + (freq_score * 0.3) + (asset_criticality * 0.3), 1
+    )
+    risk_score = min(100.0, risk_score)
+
+    # ── 5. Analyse narrative LLM ──
+    context_str = json.dumps({
+        "alert": alert.model_dump(),
+        "abuse_enrichment": abuse_data,
+        "correlated_events_24h": freq_count,
+        "asset_criticality": "HIGH" if is_critical_asset else "LOW",
+        "risk_score": risk_score,
+    }, default=str)
+
+    analysis = await _call_llm_investigation(context_str)
+
+    # ── 6. Construire l'objet Investigation ──
+    iocs = [
+        IOC(type=i.get("type", "ip"), value=i.get("value", ""), context=i.get("context", ""))
+        for i in analysis.get("iocs", [])
+    ]
+
+    investigation = Investigation(
+        alert=alert,
+        enrichment={"abuseipdb": abuse_data, "correlated_events_24h": freq_count},
+        narrative=analysis.get("summary", ""),
+        mitre_ttps=analysis.get("mitre_ttps", []),
+        iocs=iocs,
+        confidence=analysis.get("confidence", "MEDIUM"),
+        risk_score=risk_score,
+        next_likely_action=analysis.get("next_likely_action", ""),
+    )
+
+    timeline.append({
+        "timestamp": datetime.utcnow().isoformat(),
+        "event": "investigation_complete",
+        "details": f"risk_score={risk_score}, ttps={investigation.mitre_ttps}",
+    })
+
+    # WS broadcast
+    await ws_manager.broadcast("investigation_done", {
+        "incident_id": incident_id,
+        "risk_score": risk_score,
+        "mitre_ttps": investigation.mitre_ttps,
+    })
+
+    logger.info("[investigation] Done for %s — risk_score=%.1f", incident_id, risk_score)
+    return {"investigation": investigation, "status": "planning", "timeline": timeline}
+
+
+async def _call_llm_investigation(context: str) -> dict[str, Any]:
+    """Appel LLM avec retry JSON malformé + fallback codé en dur."""
+    human_msg = f"Alert et enrichissement :\n{context}"
+
+    for attempt in range(2):
         try:
-            resp = await self.llm.ainvoke([
-                SystemMessage(content=self.system_prompt),
-                HumanMessage(content=prompt)
+            resp = await llm.ainvoke([
+                SystemMessage(content=INVESTIGATION_PROMPT),
+                HumanMessage(content=human_msg),
             ])
-            # Parse JSON block
-            raw = resp.content
-            # Remove markdown JSON wrappers if any
-            if "```json" in raw:
-                raw = raw.split("```json")[1].split("```")[0].strip()
-            elif "```" in raw:
-                 raw = raw.split("```")[1].strip()
-            
+            raw = resp.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
             return json.loads(raw)
-        except Exception as e:
-            logger.error(f"Investigation Claude fallback: {e}")
-            return {
-                "summary": "Erreur lors de l'analyse par l'IA.",
-                "mitre_ttps": ["Unknown"],
-                "confidence_level": "Low",
-                "iocs": []
-            }
+        except json.JSONDecodeError:
+            if attempt == 0:
+                human_msg += "\n\nERREUR : JSON invalide. Réponds UNIQUEMENT avec le JSON demandé, sans texte autour."
+                continue
+        except Exception as exc:
+            logger.error("Investigation LLM failed: %s", exc)
+            break
 
-    async def run(self, state: IncidentState) -> Dict:
-        logger.info(f"InvestigationAgent: Starting investigation for incident {state.id}")
-        
-        alert = state.alert
-        if not alert:
-            return {"status": "planner_needed"}
-
-        # 1. Enrich AbuseIPDB
-        abuse_data = await abuseipdb_client.check_ip(alert.source_ip)
-        
-        # 2. Corrélation temporelle (ES)
-        historical_logs = await es_service.get_logs_for_ip(alert.source_ip, hours=24)
-        
-        # 3. Calculate Risk Score
-        base_abuse_score = abuse_data.get("abuseConfidenceScore", 0)
-        frequency_modifier = min(50, len(historical_logs) * 2) # Cap at 50 add
-        criticality_modifier = 20 if "root" in str(alert.raw_logs) or alert.severity == "CRITICAL" else 0
-        risk_score = min(100.0, base_abuse_score + frequency_modifier + criticality_modifier)
-
-        context = {
-            "alert": alert.model_dump(),
-            "abuse_enrichment": abuse_data,
-            "historical_logs_count": len(historical_logs),
-            "calculated_risk_score": risk_score
-        }
-
-        # 4. Narrative Analysis with Claude
-        analysis = await self._analyze_with_claude(context)
-
-        # 5. Build Investigation object
-        investigation = Investigation(
-            alert=alert,
-            enrichment={"abuseipdb": abuse_data, "historical_events_count": len(historical_logs)},
-            narrative=analysis.get("summary", ""),
-            mitre_ttps=analysis.get("mitre_ttps", []),
-            iocs=analysis.get("iocs", []),
-            risk_score=risk_score
-        )
-
-        logger.info(f"InvestigationAgent: Completed for incident {state.id}")
-        return {"investigation": investigation, "status": "planning"}
-
-investigation_agent = InvestigationAgent()
+    # Fallback
+    return {
+        "summary": "Analyse automatique non disponible — investigation manuelle recommandée.",
+        "mitre_ttps": ["T1110"],
+        "iocs": [],
+        "confidence": "LOW",
+        "next_likely_action": "Unknown",
+    }

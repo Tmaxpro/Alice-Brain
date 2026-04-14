@@ -1,81 +1,173 @@
+"""
+ALICE Brain — Detection Agent (agents/detection.py)
+──────────────────────────────────────────────────
+Poll Elasticsearch toutes les DETECTION_POLL_INTERVAL secondes.
+Détecte : brute force SSH, port scan, connexion hors horaires, privilege escalation.
+Utilise le LLM pour confirmer et scorer la confiance.
+"""
+
+from __future__ import annotations
+
+import json
 import logging
-from typing import Dict, Any, List
-from datetime import datetime
-from models.incident import IncidentState
-from models.alert import Alert
-from config import settings
+import uuid
+from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Any
 
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_anthropic import ChatAnthropic
+
+from config import settings
+from models.alert import Alert
+from services.elasticsearch import es_service
+from services.llm_factory import llm
 
 logger = logging.getLogger(__name__)
 
-class DetectionAgent:
-    def __init__(self):
-        # We initialize Claude outside standard __init__ if needed, but here is fine.
-        # It handles retries natively in Langchain/Anthropic integration
-        self.llm = ChatAnthropic(
-            model="claude-3-5-sonnet-20241022",
-            temperature=0,
-            max_tokens=1024,
-            anthropic_api_key=settings.ANTHROPIC_API_KEY,
-            max_retries=3
-        ) if settings.ANTHROPIC_API_KEY and settings.ANTHROPIC_API_KEY != "your_anthropic_api_key_here" else None
+# ── Prompt de confirmation LLM ──
+CONFIRM_PROMPT = """Tu es un analyste SOC. Voici des logs suspects.
+Confirme si c'est une vraie menace (true/false) et donne un confidence_score entre 0 et 1.
+Réponds UNIQUEMENT en JSON strict, sans markdown :
+{"is_threat": true, "confidence": 0.92, "reason": "explication courte"}"""
 
-    async def detect_anomalies(self, recent_logs: List[Dict[str, Any]]) -> List[Alert]:
-        """
-        Takes raw recent logs and identifies alerts logic.
-        (Note: the real polling logic will be in main.py APScheduler which passes logs here,
-        or this agent can poll directly. The architecture requests: "Poll Elasticsearch toutes les 30 secondes")
-        We'll do rules-based detection then pass to Claude for confirmation.
-        """
-        alerts = []
-        # Group failed logins by IP
-        failed_by_ip = {}
-        for log in recent_logs:
+
+async def _confirm_with_llm(logs_sample: list[dict], attack_type: str) -> tuple[bool, float]:
+    """
+    Appelle le LLM pour confirmer une détection et obtenir un score de confiance.
+    Retry 1 fois en cas de JSON malformé, puis fallback sur des valeurs par défaut.
+    """
+    human_msg = f"Type d'attaque suspecté : {attack_type}\nLogs (échantillon) :\n{json.dumps(logs_sample[:10], default=str)}"
+
+    for attempt in range(2):
+        try:
+            resp = await llm.ainvoke([
+                SystemMessage(content=CONFIRM_PROMPT),
+                HumanMessage(content=human_msg),
+            ])
+            raw = resp.content.strip()
+            # Nettoyage markdown
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
+
+            data = json.loads(raw)
+            return bool(data.get("is_threat", True)), float(data.get("confidence", 0.7))
+
+        except json.JSONDecodeError:
+            if attempt == 0:
+                human_msg += "\n\nERREUR : ta réponse précédente n'était pas du JSON valide. Réponds UNIQUEMENT avec le JSON demandé."
+                continue
+            logger.warning("LLM returned invalid JSON twice — using defaults")
+        except Exception as exc:
+            logger.error("LLM confirmation failed: %s", exc)
+            break
+
+    # Fallback codé en dur
+    return True, 0.75
+
+
+def _group_by_ip(logs: list[dict], ip_field: str = "source.ip") -> dict[str, list[dict]]:
+    """Regroupe les logs par IP source."""
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for log in logs:
+        # Support nested "source.ip" or flat "source_ip"
+        ip = log.get("source", {}).get("ip") if isinstance(log.get("source"), dict) else log.get("source_ip", "")
+        if not ip:
+            # Fallback: extraire depuis le message
             msg = log.get("message", "")
-            if "Failed password" in msg:
-                ip = log.get("source_ip", "unknown")
-                if ip not in failed_by_ip:
-                    failed_by_ip[ip] = []
-                failed_by_ip[ip].append(log)
+            parts = msg.split(" from ")
+            if len(parts) > 1:
+                ip = parts[1].split(" ")[0]
+        if ip:
+            groups[ip].append(log)
+    return groups
 
-        for ip, logs in failed_by_ip.items():
-            if len(logs) > 5: # Threshold: >5 failures in 60s
-                # Call Claude to confirm brute force
-                confidence_score = 0.9
-                severity = "HIGH"
-                if self.llm:
-                    prompt = f"Analyse ces logs système. S'agit-il d'une attaque brute force SSH ? Logs: {str(logs[:10])}. Réponds uniquement par OUI ou NON, suivi du niveau de confiance sur 100."
-                    try:
-                        resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
-                        content = resp.content.lower()
-                        if "oui" in content:
-                           confidence_score = 0.95
-                    except Exception as e:
-                        logger.error(f"Claude analysis failed: {e}")
-                
-                alert = Alert(
-                    type="brute_force_ssh",
-                    severity=severity,
-                    source_ip=ip,
-                    target_host=logs[0].get("host", {}).get("name", "unknown"),
-                    raw_logs=logs,
-                    confidence_score=confidence_score
-                )
-                alerts.append(alert)
+
+async def detect_brute_force() -> list[Alert]:
+    """Détecte les brute force SSH (>5 échecs en <60s depuis la même IP)."""
+    alerts: list[Alert] = []
+    logs = await es_service.get_failed_logins(seconds=60)
+
+    if not logs:
         return alerts
 
-    async def run(self, state: IncidentState) -> Dict:
-        """
-        LangGraph node execution.
-        Normally detection is the entrypoint. The orchestrator receives an alert manually or natively.
-        If state has an alert, we just pass. If we needed to poll here, we could.
-        """
-        if not state.alert:
-            # We don't have an alert. This might happen if the graph started empty.
-            pass
-        logger.info(f"DetectionAgent: Analyzed state {state.id}")
-        return {"status": "investigating"}
+    by_ip = _group_by_ip(logs)
+    for ip, ip_logs in by_ip.items():
+        if len(ip_logs) > 5:
+            is_threat, confidence = await _confirm_with_llm(ip_logs, "brute_force_ssh")
+            if is_threat and confidence > 0.6:
+                target = ip_logs[0].get("host", {}).get("name", "unknown") if isinstance(ip_logs[0].get("host"), dict) else "unknown"
+                alerts.append(Alert(
+                    type="brute_force_ssh",
+                    severity="HIGH",
+                    source_ip=ip,
+                    target_host=target,
+                    raw_logs=ip_logs[:20],
+                    confidence_score=confidence,
+                ))
+                logger.info("ALERT brute_force_ssh from %s (%d events, conf=%.2f)", ip, len(ip_logs), confidence)
 
-detection_agent = DetectionAgent()
+    return alerts
+
+
+async def detect_port_scan() -> list[Alert]:
+    """Détecte les port scans (>20 connexions refusées en <30s depuis la même IP)."""
+    alerts: list[Alert] = []
+    logs = await es_service.get_refused_connections(seconds=30)
+
+    if not logs:
+        return alerts
+
+    by_ip = _group_by_ip(logs)
+    for ip, ip_logs in by_ip.items():
+        if len(ip_logs) > 20:
+            is_threat, confidence = await _confirm_with_llm(ip_logs, "port_scan")
+            if is_threat and confidence > 0.6:
+                alerts.append(Alert(
+                    type="port_scan",
+                    severity="MEDIUM",
+                    source_ip=ip,
+                    target_host=ip_logs[0].get("host", {}).get("name", "unknown") if isinstance(ip_logs[0].get("host"), dict) else "unknown",
+                    raw_logs=ip_logs[:20],
+                    confidence_score=confidence,
+                ))
+    return alerts
+
+
+async def detect_all() -> list[Alert]:
+    """Exécute toutes les règles de détection et retourne les alertes."""
+    all_alerts: list[Alert] = []
+
+    bf_alerts = await detect_brute_force()
+    all_alerts.extend(bf_alerts)
+
+    ps_alerts = await detect_port_scan()
+    all_alerts.extend(ps_alerts)
+
+    # TODO: detect_off_hours_login, detect_priv_escalation (même pattern)
+
+    return all_alerts
+
+
+async def detect_and_inject() -> None:
+    """
+    Fonction appelée par APScheduler toutes les DETECTION_POLL_INTERVAL secondes.
+    Détecte les anomalies et injecte les alertes dans l'orchestrateur.
+    """
+    from agents.orchestrator import process_alert
+
+    logger.info("[detection] Polling Elasticsearch...")
+    alerts = await detect_all()
+
+    if not alerts:
+        logger.info("[detection] No alerts detected.")
+        return
+
+    logger.info("[detection] %d alert(s) detected — injecting into graph.", len(alerts))
+    for alert in alerts:
+        try:
+            await process_alert(alert)
+        except Exception as exc:
+            logger.exception("Failed to process alert %s: %s", alert.id, exc)

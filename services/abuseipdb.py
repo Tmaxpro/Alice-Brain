@@ -1,51 +1,46 @@
-import httpx
-from typing import Dict, Any, Optional
+"""
+ALICE Brain — AbuseIPDB Client (services/abuseipdb.py)
+────────────────────────────────────────────────────
+Enrichissement IP via l'API AbuseIPDB v2.
+Skip silencieux si la clé n'est pas configurée.
+"""
+
+from __future__ import annotations
+
 import logging
+from typing import Any
+
+import httpx
+
 from config import settings
 
 logger = logging.getLogger(__name__)
 
-class AbuseIPDBClient:
-    def __init__(self, api_key: str = None):
-        self.api_key = api_key or settings.ABUSEIPDB_KEY
-        self.base_url = "https://api.abuseipdb.com/api/v2/check"
-        
-    async def check_ip(self, ip_address: str) -> Dict[str, Any]:
-        """
-        Check an IP address against the AbuseIPDB database.
-        """
-        if not self.api_key or self.api_key == "your_abuseipdb_api_key_here":
-            logger.warning("No valid AbuseIPDB API key provided. Returning mock data.")
-            return {
-                "abuseConfidenceScore": 85 if ip_address.startswith("192.") else 10,
-                "countryCode": "US",
-                "usageType": "Data Center/Web Hosting/Transit",
-                "domain": "mockdomain.com"
-            }
-            
-        headers = {
-            'Accept': 'application/json',
-            'Key': self.api_key
-        }
-        
-        params = {
-            'ipAddress': ip_address,
-            'maxAgeInDays': '90'
-        }
-        
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(self.base_url, headers=headers, params=params, timeout=10.0)
-                response.raise_for_status()
-                data = response.json()
-                return data.get("data", {})
-        except Exception as e:
-            logger.error(f"Error connecting to AbuseIPDB for IP {ip_address}: {str(e)}")
-            # Fallback for resilience
-            return {
-                "abuseConfidenceScore": 0,
-                "error": str(e),
-                "note": "Failed to reach AbuseIPDB"
-            }
 
+class AbuseIPDBClient:
+    BASE_URL = "https://api.abuseipdb.com/api/v2/check"
+
+    async def check_ip(self, ip_address: str) -> dict[str, Any]:
+        """
+        Vérifie une IP sur AbuseIPDB.
+        Retourne un dict avec au minimum abuseConfidenceScore.
+        """
+        if not settings.ABUSEIPDB_KEY:
+            logger.info("AbuseIPDB key absent — skip enrichment for %s", ip_address)
+            return {"abuseConfidenceScore": 0, "note": "no_api_key"}
+
+        headers = {"Accept": "application/json", "Key": settings.ABUSEIPDB_KEY}
+        params = {"ipAddress": ip_address, "maxAgeInDays": "90"}
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(self.BASE_URL, headers=headers, params=params)
+                resp.raise_for_status()
+                return resp.json().get("data", {})
+        except Exception as exc:
+            logger.error("AbuseIPDB lookup failed for %s: %s", ip_address, exc)
+            return {"abuseConfidenceScore": 0, "error": str(exc)}
+
+
+# ── Singleton ──
 abuseipdb_client = AbuseIPDBClient()

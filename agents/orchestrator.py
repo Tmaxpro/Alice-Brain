@@ -1,169 +1,292 @@
-import logging
-from typing import TypedDict, Annotated, Sequence, Dict, Any
-from langgraph.graph import StateGraph, START, END
-from datetime import datetime
+"""
+ALICE Brain — Orchestrator (agents/orchestrator.py)
+──────────────────────────────────────────────────
+Graphe LangGraph StateGraph qui relie les 5 agents :
+  detect → deduplicate → investigate → plan → dispatch ↔ wait_approval → report
 
-from models.incident import IncidentState
-from agents.detection import detection_agent
-from agents.investigation import investigation_agent
-from agents.response_planner import response_planner_agent
-from agents.dispatcher import dispatcher_agent
-from agents.report import report_agent
+Utilise MemorySaver pour la persistance des états en cours.
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from datetime import datetime, timedelta
+from typing import Any, Literal, TypedDict
+
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+
+from models.alert import Alert
+from models.action import Action
+from models.incident import Investigation, IncidentState
+from models.response_plan import ResponsePlan
 from services.elasticsearch import es_service
+from services.websocket_manager import ws_manager
+from config import settings
 
 logger = logging.getLogger(__name__)
 
-def update_incident_state(left: Any, right: Any) -> Any:
-    """Reducer for the state graph. For simple objects, right overwrites left."""
-    return right if right is not None else left
 
-def merge_lists(left: list, right: list) -> list:
-    if not left: return right
-    if not right: return left
-    # simple append or deduplicate by id
-    merged = {getattr(i, "id", str(i)): i for i in left}
-    for r in right:
-        merged[getattr(r, "id", str(r))] = r
-    return list(merged.values())
+# ═══════════════════════════════════════
+#  STATE GLOBAL LANGGRAPH
+# ═══════════════════════════════════════
 
-class GraphState(TypedDict):
-    incident: Annotated[IncidentState, update_incident_state]
+class AliceState(TypedDict):
+    incident_id: str
+    alert: Alert | None
+    investigation: Investigation | None
+    response_plan: ResponsePlan | None
+    actions_pending: list[Action]
+    actions_executed: list[Action]
+    report: str | None
+    status: Literal[
+        "detecting", "investigating", "planning",
+        "dispatching", "pending_approval", "reporting",
+        "closed", "duplicate",
+    ]
+    timeline: list[dict[str, Any]]
+    error: str | None
 
-class Orchestrator:
-    def __init__(self):
-        self.workflow = StateGraph(GraphState)
-        self._build_graph()
-        self.app = self.workflow.compile()
-        self.running_incidents: Dict[str, IncidentState] = {}
 
-    def _build_graph(self):
-        # Nodes wrap our agent async classes
-        async def node_detection(state: GraphState):
-             res = await detection_agent.run(state["incident"])
-             if "status" in res:
-                 state["incident"].status = res["status"]
-             return {"incident": state["incident"]}
+# ═══════════════════════════════════════
+#  REGISTRE DES INCIDENTS (mémoire)
+# ═══════════════════════════════════════
 
-        async def node_investigation(state: GraphState):
-             res = await investigation_agent.run(state["incident"])
-             if "investigation" in res:
-                 state["incident"].investigation = res["investigation"]
-             if "status" in res:
-                 state["incident"].status = res["status"]
-             return {"incident": state["incident"]}
+# incident_id → IncidentState (version Pydantic pour l'API)
+incidents_registry: dict[str, IncidentState] = {}
 
-        async def node_response_planner(state: GraphState):
-             res = await response_planner_agent.run(state["incident"])
-             if "response_plan" in res:
-                 state["incident"].response_plan = res["response_plan"]
-             if "actions" in res:
-                 state["incident"].actions = res["actions"]
-             if "status" in res:
-                 state["incident"].status = res["status"]
-             return {"incident": state["incident"]}
 
-        async def node_dispatcher(state: GraphState):
-             res = await dispatcher_agent.run(state["incident"])
-             if "actions" in res:
-                 state["incident"].actions = res["actions"]
-             if "status" in res:
-                 state["incident"].status = res["status"]
-             return {"incident": state["incident"]}
+def _now() -> str:
+    return datetime.utcnow().isoformat()
 
-        async def node_report(state: GraphState):
-             res = await report_agent.run(state["incident"])
-             if "report" in res:
-                 state["incident"].report = res["report"]
-             if "status" in res:
-                 state["incident"].status = res["status"]
-             return {"incident": state["incident"]}
 
-        self.workflow.add_node("detection", node_detection)
-        self.workflow.add_node("investigation", node_investigation)
-        self.workflow.add_node("response_planner", node_response_planner)
-        self.workflow.add_node("dispatcher", node_dispatcher)
-        self.workflow.add_node("report", node_report)
+# ═══════════════════════════════════════
+#  NŒUDS DU GRAPHE
+# ═══════════════════════════════════════
 
-        self.workflow.add_edge(START, "detection")
+async def detection_node(state: AliceState) -> dict:
+    """Nœud de passage — l'alerte est déjà injectée dans le state."""
+    logger.info("[detect] Incident %s — alert type=%s", state["incident_id"], state["alert"].type if state["alert"] else "?")
+    timeline = state.get("timeline", [])
+    timeline.append({"timestamp": _now(), "event": "alert_received", "details": f"type={state['alert'].type}" if state['alert'] else ""})
+    return {"status": "detecting", "timeline": timeline}
 
-        # Routing logic
-        def route_after_detection(state: GraphState):
-             return "investigation" if state["incident"].status == "investigating" else END
 
-        def route_after_investigation(state: GraphState):
-             return "response_planner" if state["incident"].status == "planning" else END
+async def dedup_node(state: AliceState) -> dict:
+    """
+    Déduplique : si un incident ouvert existe pour la même IP + même type
+    dans la fenêtre DEDUP_WINDOW_MINUTES → marque comme 'duplicate'.
+    """
+    alert = state["alert"]
+    if not alert:
+        return {"status": "duplicate"}
 
-        def route_after_planner(state: GraphState):
-             return "dispatcher" if state["incident"].status == "dispatching" else END
+    window = timedelta(minutes=settings.DEDUP_WINDOW_MINUTES)
+    now = datetime.utcnow()
 
-        def route_after_dispatcher(state: GraphState):
-             if state["incident"].status == "reporting":
-                 return "report"
-             return END # 'mitigating' means it waits for manual approval
+    for inc in incidents_registry.values():
+        if inc.status in ("closed", "duplicate"):
+            continue
+        if inc.id == state["incident_id"]:
+            continue
+        if (
+            inc.alert
+            and inc.alert.source_ip == alert.source_ip
+            and inc.alert.type == alert.type
+            and (now - inc.alert.timestamp) < window
+        ):
+            logger.info("[dedup] Duplicate detected for %s — skipping", alert.source_ip)
+            return {"status": "duplicate"}
 
-        self.workflow.add_conditional_edges("detection", route_after_detection)
-        self.workflow.add_conditional_edges("investigation", route_after_investigation)
-        self.workflow.add_conditional_edges("response_planner", route_after_planner)
-        self.workflow.add_conditional_edges("dispatcher", route_after_dispatcher)
-        
-        self.workflow.add_edge("report", END)
+    return {"status": "investigating"}
 
-    async def process_new_alert(self, alert):
-        """Call when a new alert is generated manually or via polling"""
-        # Deduplication simple
-        for inc_id, inc in self.running_incidents.items():
-             if inc.alert and inc.alert.source_ip == alert.source_ip and inc.alert.type == alert.type:
-                  # Verifier timestamp < 5 min
-                  delta = datetime.utcnow() - inc.alert.timestamp
-                  if delta.total_seconds() < 300:
-                       logger.info(f"Deduplicated alert for {alert.source_ip}")
-                       return
 
-        new_incident = IncidentState(alert=alert)
-        new_incident.timeline.append({"time": datetime.utcnow().isoformat(), "event": "Alert received"})
-        self.running_incidents[new_incident.id] = new_incident
-        
-        # Save to ES
-        await es_service.index_document("alice-incidents", new_incident.model_dump(), new_incident.id)
-        
-        # Run graph
-        await self.app.ainvoke({"incident": new_incident})
+async def investigation_node(state: AliceState) -> dict:
+    """Délègue au module agents/investigation.py."""
+    from agents.investigation import run_investigation
+    return await run_investigation(state)
 
-    async def approve_action_and_resume(self, incident_id: str, action_id: str):
-        if incident_id not in self.running_incidents:
-            return False
-        
-        incident = self.running_incidents[incident_id]
-        action_found = False
-        for action in incident.actions:
-            if action.id == action_id and action.status == "pending_approval":
-                action.status = "executed"  # Simulate execution upon approval
-                action.approved = True
-                action.executed = True
-                action_found = True
-                incident.timeline.append({"time": datetime.utcnow().isoformat(), "event": f"Action {action_id} approved and executed"})
-                break
-        
-        if not action_found:
-            return False
 
-        # Save to ES
-        await es_service.index_document("alice-incidents", incident.model_dump(), incident.id)
+async def response_planner_node(state: AliceState) -> dict:
+    """Délègue au module agents/response_planner.py."""
+    from agents.response_planner import run_response_planner
+    return await run_response_planner(state)
 
-        # Re-run graph from dispatcher
-        # LangGraph state management allows invoking from a specific node with StateGraph
-        # Here for simplicity we just re-feed the updated incident state. The graph will start from START (detection) -> investigate -> etc.
-        # But wait, our nodes are side-effect free if they check current status.
-        # To make it cleanly resume without re-running everything:
-        
-        incident.status = "dispatching" # Force it to continue to routing correctly.
-        # Actually in Langgraph a true checkpoint saver allows resuming. Since we simulate:
-        # we will directly call dispatcher then report manually or re-invoke. 
-        # For simplicity without proper Checkpointer config, we manually push through:
-        res = await dispatcher_agent.run(incident)
-        if res["status"] == "reporting":
-            await report_agent.run(incident)
-            
-        return True
 
-orchestrator = Orchestrator()
+async def dispatcher_node(state: AliceState) -> dict:
+    """Délègue au module agents/dispatcher.py."""
+    from agents.dispatcher import run_dispatcher
+    return await run_dispatcher(state)
+
+
+async def approval_gate_node(state: AliceState) -> dict:
+    """
+    Nœud bloquant : attend l'approbation humaine pour chaque action pending.
+    Utilise le mécanisme asyncio.Queue de services/approval_queue.py.
+    """
+    from services.approval_queue import wait_for_approval
+
+    pending = list(state.get("actions_pending", []))
+    executed = list(state.get("actions_executed", []))
+    timeline = list(state.get("timeline", []))
+
+    still_pending: list[Action] = []
+
+    for action in pending:
+        if not action.requires_approval:
+            # Shouldn't happen here, but safety
+            still_pending.append(action)
+            continue
+
+        logger.info("[approval_gate] Waiting for approval on action %s (%s)", action.id, action.type)
+        approved = await wait_for_approval(action.id, timeout=300)
+
+        if approved:
+            action.approved = True
+            action.status = "approved"
+            timeline.append({"timestamp": _now(), "event": "action_approved", "details": f"{action.type} ({action.id})"})
+            still_pending.append(action)  # Will be executed in next dispatcher pass
+        else:
+            action.status = "rejected" if not approved else "timeout"
+            timeline.append({"timestamp": _now(), "event": "action_rejected", "details": f"{action.type} ({action.id})"})
+            executed.append(action)  # Move to executed (as rejected/timeout)
+
+    return {
+        "actions_pending": still_pending,
+        "actions_executed": executed,
+        "status": "dispatching",
+        "timeline": timeline,
+    }
+
+
+async def report_node(state: AliceState) -> dict:
+    """Délègue au module agents/report.py."""
+    from agents.report import run_report
+    return await run_report(state)
+
+
+# ═══════════════════════════════════════
+#  CONSTRUCTION DU GRAPHE
+# ═══════════════════════════════════════
+
+def _build_graph() -> StateGraph:
+    graph = StateGraph(AliceState)
+
+    # Nœuds
+    graph.add_node("detect", detection_node)
+    graph.add_node("deduplicate", dedup_node)
+    graph.add_node("investigate", investigation_node)
+    graph.add_node("plan", response_planner_node)
+    graph.add_node("dispatch", dispatcher_node)
+    graph.add_node("wait_approval", approval_gate_node)
+    graph.add_node("report", report_node)
+
+    # Edges
+    graph.add_edge(START, "detect")
+    graph.add_edge("detect", "deduplicate")
+
+    # Après déduplication
+    graph.add_conditional_edges(
+        "deduplicate",
+        lambda s: "skip" if s["status"] == "duplicate" else "continue",
+        {"skip": END, "continue": "investigate"},
+    )
+
+    graph.add_edge("investigate", "plan")
+    graph.add_edge("plan", "dispatch")
+
+    # Après dispatch
+    graph.add_conditional_edges(
+        "dispatch",
+        lambda s: "needs_approval" if s.get("actions_pending") else "auto_complete",
+        {"needs_approval": "wait_approval", "auto_complete": "report"},
+    )
+
+    # Retour après approbation
+    graph.add_edge("wait_approval", "dispatch")
+
+    graph.add_edge("report", END)
+
+    return graph
+
+
+# Compilation avec checkpointer MemorySaver
+checkpointer = MemorySaver()
+_graph = _build_graph()
+alice_graph = _graph.compile(checkpointer=checkpointer)
+
+
+# ═══════════════════════════════════════
+#  POINT D'ENTRÉE PUBLIC
+# ═══════════════════════════════════════
+
+async def process_alert(alert: Alert) -> str:
+    """
+    Injecte une alerte dans le graphe LangGraph et exécute le pipeline complet.
+    Retourne l'incident_id.
+    """
+    incident_id = str(uuid.uuid4())
+
+    # Créer l'entrée dans le registre
+    incident = IncidentState(
+        id=incident_id,
+        alert=alert,
+        status="detecting",
+        timeline=[{"timestamp": _now(), "event": "incident_created", "details": ""}],
+    )
+    incidents_registry[incident_id] = incident
+
+    # Indexer dans ES
+    await es_service.index_document(
+        settings.ES_INDEX_INCIDENTS, incident.model_dump(), incident_id
+    )
+
+    # Broadcaster via WS
+    await ws_manager.broadcast("new_alert", {
+        "incident_id": incident_id,
+        "severity": alert.severity,
+        "type": alert.type,
+        "source_ip": alert.source_ip,
+    })
+
+    # Construire le state initial
+    initial_state: AliceState = {
+        "incident_id": incident_id,
+        "alert": alert,
+        "investigation": None,
+        "response_plan": None,
+        "actions_pending": [],
+        "actions_executed": [],
+        "report": None,
+        "status": "detecting",
+        "timeline": [],
+        "error": None,
+    }
+
+    # Exécuter le graphe
+    config = {"configurable": {"thread_id": incident_id}}
+    try:
+        final_state = await alice_graph.ainvoke(initial_state, config=config)
+
+        # Mettre à jour le registre avec le state final
+        incident.status = final_state.get("status", "closed")
+        incident.investigation = final_state.get("investigation")
+        incident.response_plan = final_state.get("response_plan")
+        incident.actions_pending = final_state.get("actions_pending", [])
+        incident.actions_executed = final_state.get("actions_executed", [])
+        incident.report = final_state.get("report")
+        incident.timeline = final_state.get("timeline", [])
+        incident.error = final_state.get("error")
+
+    except Exception as exc:
+        logger.exception("Graph execution failed for incident %s", incident_id)
+        incident.status = "closed"
+        incident.error = str(exc)
+
+    # Mise à jour finale dans ES
+    await es_service.index_document(
+        settings.ES_INDEX_INCIDENTS, incident.model_dump(), incident_id
+    )
+
+    return incident_id
