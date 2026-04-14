@@ -20,7 +20,13 @@ logger = logging.getLogger(__name__)
 
 class ElasticService:
     def __init__(self) -> None:
-        self.client = AsyncElasticsearch(settings.ES_URL)
+        client_kwargs = {}
+        if settings.ES_VERIFY_CERTS is False:
+            client_kwargs["verify_certs"] = False
+        if settings.ES_USER and settings.ES_PASSWORD:
+            client_kwargs["basic_auth"] = (settings.ES_USER, settings.ES_PASSWORD)
+            
+        self.client = AsyncElasticsearch(settings.ES_URL, **client_kwargs)
 
     # ──────────────── Health ────────────────
 

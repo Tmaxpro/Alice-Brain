@@ -15,15 +15,22 @@ class Settings(BaseSettings):
 
     # ── Elasticsearch ──
     ES_URL: str = "http://localhost:9200"
+    ES_USER: str | None = None
+    ES_PASSWORD: str | None = None
+    ES_VERIFY_CERTS: bool = True
     ES_INDEX_LOGS: str = "logs-*"
     ES_INDEX_INCIDENTS: str = "alice-incidents"
     ES_INDEX_ACTIONS: str = "alice-actions"
     ES_INDEX_REPORTS: str = "alice-reports"
+    ES_INDEX_AGENTS: str = "alice-agents"
 
-    # ── Agents client-side ──
+    # ── Agents client-side (DEPRECATED — utiliser le registre dynamique) ──
     ENDPOINT_AGENT_URL: str = "http://localhost:8001"
     NETWORK_AGENT_URL: str = "http://localhost:8002"
     NOTIF_AGENT_URL: str = "http://localhost:8004"
+
+    # ── Brain WebSocket ──
+    BRAIN_WS_HOST: str = "0.0.0.0"       # Adresse exposée aux agents pour le WS
 
     # ── Enrichissement ──
     ABUSEIPDB_KEY: str | None = None
